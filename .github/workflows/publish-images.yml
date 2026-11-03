@@ -1,6 +1,5 @@
 name: CD
-# Fork-only verification snapshot: deploy is hard-disabled; only personal test images are pushed.
-
+# 개인 Fork 전용: 이미 게시·검증된 SHA 이미지를 별도 서버 프로젝트에 배포한다.
 on:
   push:
     branches: [ci/cd-fork-test]
@@ -9,51 +8,48 @@ permissions:
   contents: read
 
 concurrency:
-  group: storyfork-fork-test-${{ github.ref_name }}
+  group: storyfork-fork-server-cd-test
   cancel-in-progress: false
+
+env:
+  IMAGE_SHA: 660c994b9947ab9637fc2ae26f5bba2439948c8f
+  CD_WEB_IMAGE: ghcr.io/seongho-haru/storyfork-cd-test-web@sha256:5d20615b6128a58d715be1c5857cbb95bfa536f48196d2d976d0edb3c2ce0937
+  CD_CORE_API_IMAGE: ghcr.io/seongho-haru/storyfork-cd-test-core-api@sha256:b92d7dee944141293c881bfc03cd05c536b290c46cb9930c5b1385d4ffa2821d
+  CD_AI_SERVICE_IMAGE: ghcr.io/seongho-haru/storyfork-cd-test-ai-service@sha256:5460145da33488c9b09f7e53441a4dbe4ca46832e33466bc405f8e895b76d2c3
 
 jobs:
   publish:
-    name: Publish fork test images
-    if: ${{ (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop') || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'develop' && github.event.workflow_run.head_repository.full_name == github.repository && (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch')) || (github.repository == 'Seongho-haru/SKN34-FINAL-4TEAM' && github.event_name == 'push' && github.ref == 'refs/heads/ci/cd-fork-test') }}
+    name: Verify previously published fork images
+    # 기존 정적 CD 계약을 유지한다. 이 variant의 유일한 trigger는 위의 개인 테스트 브랜치 push다.
+    if: ${{ github.repository == 'Seongho-haru/SKN34-FINAL-4TEAM' && ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop') || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'develop' && github.event.workflow_run.head_repository.full_name == github.repository && (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch')) || (github.event_name == 'push' && github.ref == 'refs/heads/ci/cd-fork-test')) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 5
     permissions:
       contents: read
-      packages: write
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TARGET_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      packages: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           persist-credentials: false
-      - name: Build and push fork test images
+      - name: Verify immutable manifests without rebuilding
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           umask 077
-          scratch=$(mktemp -d)
-          trap 'rm -rf -- "$scratch"' EXIT
-          export DOCKER_CONFIG="$scratch"
+          export DOCKER_CONFIG
+          DOCKER_CONFIG=$(mktemp -d)
+          trap 'rm -rf -- "$DOCKER_CONFIG"' EXIT
           printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          for service in web core-api ai-service; do
-            image="ghcr.io/seongho-haru/storyfork-cd-test-$service"
-            context="backend/$service"
-            if [[ "$service" == web ]]; then context=frontend; fi
-            docker build --platform linux/amd64 \
-              --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
-              --label "org.opencontainers.image.revision=$TARGET_SHA" \
-              --tag "$image:sha-$TARGET_SHA" "$context"
-            docker push "$image:sha-$TARGET_SHA"
+          for image in "$CD_WEB_IMAGE" "$CD_CORE_API_IMAGE" "$CD_AI_SERVICE_IMAGE"; do
+            docker manifest inspect "$image" > /dev/null
           done
 
   deploy:
-    name: Deploy develop images
+    name: Deploy isolated fork server test
     needs: publish
-    # publish가 같은 저장소 develop의 CI 성공 또는 명시적인 develop 수동 실행만 허용한다.
-    # workflow_run의 ref는 기본 브랜치, 수동 실행의 ref는 develop이므로 main-only 검사는 하지 않는다.
-    if: ${{ false }} # Fork test: never execute server/Tailscale/SSH steps.
+    if: ${{ needs.publish.result == 'success' && github.repository == 'Seongho-haru/SKN34-FINAL-4TEAM' && github.event_name == 'push' && github.ref == 'refs/heads/ci/cd-fork-test' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -62,8 +58,9 @@ jobs:
       id-token: write
     environment: develop-cd
     env:
-      CD_DEPLOY_DIR: ${{ vars.CD_DEPLOY_DIR }}
-      CD_WEB_PORT: ${{ vars.CD_WEB_PORT }}
+      # 저장소의 실제 CD_DEPLOY_DIR/기존8088 스택은 사용하지 않는다.
+      CD_DEPLOY_DIR: /home/tgv99536/storyfork-cd-test
+      CD_WEB_PORT: "8081"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -79,54 +76,87 @@ jobs:
           SSH_PRIVATE_KEY: ${{ secrets.CD_SSH_PRIVATE_KEY }}
           SSH_KNOWN_HOSTS: ${{ secrets.CD_SSH_KNOWN_HOSTS }}
         run: |
+          set -euo pipefail
           umask 077
           SSH_DIR="$RUNNER_TEMP/storyfork-ssh"
           printf 'SSH_DIR=%s\n' "$SSH_DIR" >> "$GITHUB_ENV"
           mkdir -p "$SSH_DIR"
           printf '%s\n' "$SSH_PRIVATE_KEY" > "$SSH_DIR/key"
           printf '%s\n' "$SSH_KNOWN_HOSTS" > "$SSH_DIR/known_hosts"
-      - name: Pull and start develop images
+      - name: Pull and start isolated test images
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           {
-            # 설정과 토큰은 명령 인자가 아닌 암호화된 SSH stdin으로 전달한다.
             printf '%s=%q\n' CD_DIRECTORY "$CD_DEPLOY_DIR" CD_WEB_PORT "$CD_WEB_PORT" \
-              GITHUB_ACTOR "$GITHUB_ACTOR" GH_TOKEN "$GH_TOKEN" \
+              GITHUB_ACTOR "$GITHUB_ACTOR" GH_TOKEN "$GH_TOKEN" IMAGE_SHA "$IMAGE_SHA" \
+              CD_WEB_IMAGE "$CD_WEB_IMAGE" CD_CORE_API_IMAGE "$CD_CORE_API_IMAGE" CD_AI_SERVICE_IMAGE "$CD_AI_SERVICE_IMAGE" \
               COMPOSE_BASE_YAML "$(< infrastructure/docker-compose.yaml)" \
-              COMPOSE_DEV_YAML "$(< infrastructure/docker-compose.dev.yaml)"
+              COMPOSE_PROD_YAML "$(< infrastructure/docker-compose.prod.yaml)" \
+              COMPOSE_CI_YAML "$(< infrastructure/ci/compose.test.yaml)"
             cat <<'REMOTE'
           set -euo pipefail
           umask 077
+          [[ "$CD_DIRECTORY" == /home/tgv99536/storyfork-cd-test && "$CD_WEB_PORT" == 8081 ]] || exit 1
+          [[ ! -L "$CD_DIRECTORY" && -O "$CD_DIRECTORY" ]] || exit 1
           cd -P -- "$CD_DIRECTORY"
-          [[ "$PWD" == "$CD_DIRECTORY" && -f .env ]] || exit 1
-          export CD_DIRECTORY CD_WEB_PORT COMPOSE_PROJECT_NAME=storyfork-develop-cd DOCKER_HOST=unix:///var/run/docker.sock
+          [[ "$PWD" == "$CD_DIRECTORY" && -f .env && ! -L .env && -O .env && "$(stat -c '%a' .env)" == 600 ]] || exit 1
+          printf 'REMOTE_IDENTITY %s %s %s\n' "$PWD" "$(whoami)" "$(hostname)"
+          export CD_DIRECTORY CD_WEB_PORT CD_WEB_IMAGE CD_CORE_API_IMAGE CD_AI_SERVICE_IMAGE
+          export COMPOSE_PROJECT_NAME=storyfork-fork-cd-test DOCKER_HOST=unix:///var/run/docker.sock
           unset DOCKER_CONTEXT
           export DOCKER_CONFIG
           DOCKER_CONFIG=$(mktemp -d)
           trap 'rm -rf -- "$DOCKER_CONFIG"' EXIT
-          export COMPOSE_FILE="$DOCKER_CONFIG/docker-compose.yaml:$DOCKER_CONFIG/docker-compose.dev.yaml"
-          printf '%s\n' "$COMPOSE_BASE_YAML" > "$DOCKER_CONFIG/docker-compose.yaml"
-          printf '%s\n' "$COMPOSE_DEV_YAML" > "$DOCKER_CONFIG/docker-compose.dev.yaml"
-
-          # 같은 프로젝트 이름을 사용하는 다른 배포는 변경하지 않는다.
-          containers=$(docker container ls --all --quiet --filter label=com.docker.compose.project=storyfork-develop-cd)
+          export COMPOSE_FILE="$CD_DIRECTORY/docker-compose.yaml:$CD_DIRECTORY/docker-compose.prod.yaml:$CD_DIRECTORY/compose.ci.yaml:$CD_DIRECTORY/compose.fork-test.yaml"
+          containers=$(docker container ls --all --quiet --filter label=com.docker.compose.project=storyfork-fork-cd-test)
           for container in $containers; do
             [[ "$(docker container inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$container")" == "$CD_DIRECTORY" ]] || exit 1
           done
-
+          printf '%s\n' "$COMPOSE_BASE_YAML" > docker-compose.yaml
+          printf '%s\n' "$COMPOSE_PROD_YAML" > docker-compose.prod.yaml
+          printf '%s\n' "$COMPOSE_CI_YAML" > compose.ci.yaml
+          cat > compose.fork-test.yaml <<'COMPOSE'
+          # 일회성 CI DB/Mailpit 격리 + 개인 GHCR 이미지 전용, 원본/공유 DB 미접속.
+          services:
+            mailpit:
+              ports: !reset []
+            ai-service:
+              build: !reset null
+              image: ${CD_AI_SERVICE_IMAGE:?Pinned personal image required}
+              platform: linux/amd64
+            core-api:
+              build: !reset null
+              image: ${CD_CORE_API_IMAGE:?Pinned personal image required}
+              platform: linux/amd64
+              environment:
+                APP_CORS_ALLOWED_ORIGIN: http://127.0.0.1:8081
+            web:
+              build: !reset null
+              image: ${CD_WEB_IMAGE:?Pinned personal image required}
+              platform: linux/amd64
+              ports: !override ["127.0.0.1:8081:80"]
+          COMPOSE
+          docker compose --project-directory "$CD_DIRECTORY" --env-file .env config --quiet
           printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           unset GH_TOKEN
-          # 서버 .env의 과거 image override 대신 최신 develop을 사용한다.
-          export CD_WEB_IMAGE=ghcr.io/sknetworks-family-aicamp/storyfork-web:develop
-          export CD_CORE_API_IMAGE=ghcr.io/sknetworks-family-aicamp/storyfork-core-api:develop
-          export CD_AI_SERVICE_IMAGE=ghcr.io/sknetworks-family-aicamp/storyfork-ai-service:develop
           docker compose --project-directory "$CD_DIRECTORY" --env-file .env pull
-          images=$(docker compose --project-directory "$CD_DIRECTORY" --env-file .env config --images)
-          revisions=$(docker image inspect $images --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' | sort -u)
-          [[ "$revisions" =~ ^[0-9a-f]{40}$ ]] || { printf 'Mixed or missing develop image revisions; rerun CD.\n' >&2; exit 1; }
+          for image in "$CD_WEB_IMAGE" "$CD_CORE_API_IMAGE" "$CD_AI_SERVICE_IMAGE"; do
+            revision=$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+            [[ "$revision" == "$IMAGE_SHA" ]] || exit 1
+            printf 'PULLED_REVISION %s %s\n' "$image" "$revision"
+          done
           docker compose --project-directory "$CD_DIRECTORY" --env-file .env up -d --no-build --pull never --wait --wait-timeout 180
+          for path in / /api/v1/health /api/v1/health/ai-service; do
+            curl --noproxy '*' --retry 60 --retry-delay 2 --retry-all-errors --max-time 10 --fail --silent --show-error --output /dev/null "http://127.0.0.1:8081$path"
+            printf 'HTTP_READY %s 200\n' "$path"
+          done
+          code=$(curl --noproxy '*' --max-time 10 --silent --show-error --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8081/api/v1/me)
+          [[ "$code" == 401 ]] || exit 1
+          printf 'HTTP_ANONYMOUS /api/v1/me %s\n' "$code"
+          docker compose --project-directory "$CD_DIRECTORY" --env-file .env ps
+          printf 'FORK_SERVER_DEPLOY_COMPLETE\n'
           REMOTE
           } | ssh -F /dev/null -T -p 5798 -i "$SSH_DIR/key" \
             -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$SSH_DIR/known_hosts" \
@@ -135,4 +165,5 @@ jobs:
             tgv99536@100.90.8.124 'bash -se'
       - name: Clean up SSH credentials
         if: ${{ always() }}
-        run: rm -rf -- "$SSH_DIR"
+        run: |
+          if [[ -n "${SSH_DIR:-}" ]]; then rm -rf -- "$SSH_DIR"; fi
