@@ -37,7 +37,6 @@ def web():
     base = os.environ["HTTP_BASE_URL"]
     assert re.fullmatch(r"http://127\.0\.0\.1:\d+", base), "Loopback CI URL required"
     with httpx2.Client(base_url=base, timeout=15, trust_env=False) as client:
-        refresh_csrf(client)
         yield client
 
 
@@ -45,6 +44,7 @@ def web():
 def signed_in(web):
     email = str(uuid.uuid4()) + "@example.invalid"
     password = "ci-only-signup-password"
+    refresh_csrf(web)
     response = web.post("/api/v1/auth/signup", json={"email": email, "password": password, "nickname": "CI Reader"})
     assert response.status_code == 202
     base = os.environ["MAILPIT_API_URL"]
@@ -66,19 +66,21 @@ def signed_in(web):
     assert message is not None, "Verification mail not received"
     token = re.search(r"#token=([A-Za-z0-9_-]+)", message["Text"])
     assert token is not None, "Verification link missing"
+    refresh_csrf(web)
     response = web.post("/api/v1/auth/verify-email", json={"token": token.group(1), "password": password})
     assert response.status_code == 204
+    refresh_csrf(web)
     response = web.post("/api/v1/auth/login", json={"email": email, "password": password})
     assert response.status_code == 200
     login = response.json()
     web.headers["Authorization"] = "Bearer " + login["accessToken"]
-    refresh_csrf(web)
     return {"client": web, "email": email, "id": str(uuid.UUID(login["user"]["id"]))}
 
 
 @pytest.fixture(scope="session")
 def draft_work(signed_in):
     client = signed_in["client"]
+    refresh_csrf(client)
     response = client.post("/api/v1/works", json={"title": "CI work"})
     assert response.status_code == 201
     work_id = str(uuid.UUID(response.json()["id"]))
@@ -86,6 +88,7 @@ def draft_work(signed_in):
     response = client.get(path)
     assert response.status_code == 200
     draft = {"title": "CI chapter", "body": "CI persisted manuscript", "revision": response.json()["draft"]["revision"]}
+    refresh_csrf(client)
     response = client.put(path + "/draft", json=draft)
     assert response.status_code == 200
     saved = response.json()["draft"]
@@ -109,6 +112,7 @@ def test_auth(signed_in):
     with httpx2.Client(base_url=client.base_url, timeout=15, trust_env=False) as anonymous:
         assert anonymous.get("/api/v1/me").status_code == 401
         assert anonymous.post("/api/v1/auth/signup", json={"email": "csrf@example.invalid", "password": "ci-only-password", "nickname": "CSRF"}).status_code == 403
+    refresh_csrf(client)
     response = client.post("/api/v1/auth/login", json={"email": signed_in["email"], "password": "wrong-password"})
     assert response.status_code == 401
     response = client.get("/api/v1/me")
@@ -121,6 +125,7 @@ def test_auth(signed_in):
 def test_content(draft_work):
     client, path = draft_work["client"], draft_work["path"]
     assert draft_work["saved"]["body"] == draft_work["request"]["body"]
+    refresh_csrf(client)
     assert client.put(path + "/draft", json=draft_work["request"]).status_code == 409
     response = client.get(path)
     assert response.status_code == 200
@@ -138,6 +143,7 @@ def test_ai_failure(draft_work):
     response = client.get(path)
     assert response.status_code == 200
     before = response.json()["draft"]
+    refresh_csrf(client)
     response = client.post(path + "/proposals", json={"revision": before["revision"], "prompt": "Continue", "consent": True})
     assert response.status_code == 503
     response = client.get(path)

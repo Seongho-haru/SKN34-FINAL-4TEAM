@@ -116,6 +116,23 @@ class SystemContractTest(unittest.TestCase):
         self.assertIn('curl --retry', workflow)
         self.assertIn('down --volumes --remove-orphans', workflow)
 
+    def test_system_mutations_refresh_csrf_per_request(self):
+        source = (ci.ROOT / 'infrastructure/system/test_http.py').read_text()
+        mutations = 0
+        for function in ast.parse(source).body:
+            if not isinstance(function, ast.FunctionDef):
+                continue
+            for index, statement in enumerate(function.body):
+                for call in ast.walk(statement):
+                    if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                            and call.func.attr in {'post', 'put'} and isinstance(call.func.value, ast.Name)
+                            and call.func.value.id in {'client', 'web'}):
+                        with self.subTest(function=function.name, line=call.lineno):
+                            self.assertGreater(index, 0)
+                            self.assertEqual(f'refresh_csrf({call.func.value.id})', ast.unparse(function.body[index - 1]))
+                        mutations += 1
+        self.assertEqual(8, mutations)  # Anonymous missing-CSRF rejection stays intentionally unrefreshed.
+
 
 class ConfigurationTest(unittest.TestCase):
     def test_core_context_http_and_db_tests_are_not_unit_tests(self):
@@ -144,6 +161,15 @@ class ConfigurationTest(unittest.TestCase):
                 checkout = source.split(f'\n  {job}:\n', 1)[1].split('uses: actions/checkout@', 1)[1].split('\n      - ', 1)[0]
                 self.assertIn('ref: ${{ github.event.workflow_run.head_sha || github.sha }}', checkout)
                 self.assertIn('persist-credentials: false', checkout)
+
+    def test_cd_ssh_directory_uses_step_runner_temp(self):
+        source = (ci.ROOT / '.github/workflows/publish-images.yml').read_text()
+        deploy = source.split('\n  deploy:\n', 1)[1]
+        job_env = deploy.split('\n    env:\n', 1)[1].split('\n    steps:\n', 1)[0]
+        self.assertNotIn('${{ runner.', job_env)
+        prepare = deploy.split('      - name: Prepare SSH\n', 1)[1].split('\n      - name:', 1)[0]
+        self.assertIn('SSH_DIR="$RUNNER_TEMP/storyfork-ssh"', prepare)
+        self.assertIn('printf \'SSH_DIR=%s\\n\' "$SSH_DIR" >> "$GITHUB_ENV"', prepare)
 
     def test_cd_is_one_trusted_publish_then_deploy_workflow(self):
         source = (ci.ROOT / '.github/workflows/publish-images.yml').read_text()

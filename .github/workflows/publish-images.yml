@@ -62,7 +62,6 @@ jobs:
       id-token: write
     environment: develop-cd
     env:
-      SSH_DIR: /tmp/storyfork-ssh-disabled # Hard-disabled job; runner context is invalid at job env scope.
       CD_DEPLOY_DIR: ${{ vars.CD_DEPLOY_DIR }}
       CD_WEB_PORT: ${{ vars.CD_WEB_PORT }}
     steps:
@@ -81,6 +80,8 @@ jobs:
           SSH_KNOWN_HOSTS: ${{ secrets.CD_SSH_KNOWN_HOSTS }}
         run: |
           umask 077
+          SSH_DIR="$RUNNER_TEMP/storyfork-ssh"
+          printf 'SSH_DIR=%s\n' "$SSH_DIR" >> "$GITHUB_ENV"
           mkdir -p "$SSH_DIR"
           printf '%s\n' "$SSH_PRIVATE_KEY" > "$SSH_DIR/key"
           printf '%s\n' "$SSH_KNOWN_HOSTS" > "$SSH_DIR/known_hosts"
