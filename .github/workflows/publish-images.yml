@@ -1,5 +1,5 @@
 name: CD
-# 개인 Fork 전용: 이미 게시·검증된 SHA 이미지를 별도 서버 프로젝트에 배포한다.
+# 개인 Fork 전용: 기존 게시 이미지로 새 영속 DB/Mailpit 기반 서버를 교체한다.
 on:
   push:
     branches: [ci/cd-fork-test]
@@ -47,7 +47,7 @@ jobs:
           done
 
   deploy:
-    name: Deploy isolated fork server test
+    name: Replace approved server app services
     needs: publish
     if: ${{ needs.publish.result == 'success' && github.repository == 'Seongho-haru/SKN34-FINAL-4TEAM' && github.event_name == 'push' && github.ref == 'refs/heads/ci/cd-fork-test' }}
     runs-on: ubuntu-24.04
@@ -58,9 +58,9 @@ jobs:
       id-token: write
     environment: develop-cd
     env:
-      # 저장소의 실제 CD_DEPLOY_DIR/기존8088 스택은 사용하지 않는다.
+      # 실제 checkout/저장소 변수는 보존한다.8088은 기존 HTTPS upstream 재사용을 위한 승인값이다.
       CD_DEPLOY_DIR: /home/tgv99536/storyfork-cd-test
-      CD_WEB_PORT: "8081"
+      CD_WEB_PORT: "8088"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -83,7 +83,7 @@ jobs:
           mkdir -p "$SSH_DIR"
           printf '%s\n' "$SSH_PRIVATE_KEY" > "$SSH_DIR/key"
           printf '%s\n' "$SSH_KNOWN_HOSTS" > "$SSH_DIR/known_hosts"
-      - name: Pull and start isolated test images
+      - name: Preflight, pull, warm up, and replace approved apps
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -93,12 +93,11 @@ jobs:
               GITHUB_ACTOR "$GITHUB_ACTOR" GH_TOKEN "$GH_TOKEN" IMAGE_SHA "$IMAGE_SHA" \
               CD_WEB_IMAGE "$CD_WEB_IMAGE" CD_CORE_API_IMAGE "$CD_CORE_API_IMAGE" CD_AI_SERVICE_IMAGE "$CD_AI_SERVICE_IMAGE" \
               COMPOSE_BASE_YAML "$(< infrastructure/docker-compose.yaml)" \
-              COMPOSE_PROD_YAML "$(< infrastructure/docker-compose.prod.yaml)" \
-              COMPOSE_CI_YAML "$(< infrastructure/ci/compose.test.yaml)"
+              COMPOSE_PROD_YAML "$(< infrastructure/docker-compose.prod.yaml)"
             cat <<'REMOTE'
           set -euo pipefail
           umask 077
-          [[ "$CD_DIRECTORY" == /home/tgv99536/storyfork-cd-test && "$CD_WEB_PORT" == 8081 ]] || exit 1
+          [[ "$CD_DIRECTORY" == /home/tgv99536/storyfork-cd-test && "$CD_WEB_PORT" == 8088 ]] || exit 1
           [[ ! -L "$CD_DIRECTORY" && -O "$CD_DIRECTORY" ]] || exit 1
           cd -P -- "$CD_DIRECTORY"
           [[ "$PWD" == "$CD_DIRECTORY" && -f .env && ! -L .env && -O .env && "$(stat -c '%a' .env)" == 600 ]] || exit 1
@@ -108,35 +107,59 @@ jobs:
           unset DOCKER_CONTEXT
           export DOCKER_CONFIG
           DOCKER_CONFIG=$(mktemp -d)
-          trap 'rm -rf -- "$DOCKER_CONFIG"' EXIT
-          export COMPOSE_FILE="$CD_DIRECTORY/docker-compose.yaml:$CD_DIRECTORY/docker-compose.prod.yaml:$CD_DIRECTORY/compose.ci.yaml:$CD_DIRECTORY/compose.fork-test.yaml"
+          export COMPOSE_FILE="$CD_DIRECTORY/docker-compose.yaml:$CD_DIRECTORY/docker-compose.prod.yaml:$CD_DIRECTORY/compose.fork-test.yaml"
+          # ponytail: one-shot cutover pins old IDs; recurring CD must replace this test-only cutover.
+          old_web=1e0f0b05c1bb9fdb11b095ffa1b4b42f1af4a2a90670c33febe6a66492e684f7
+          old_core=a3438aa243640bdf196d0c4a5b295e48dc440cee9aa0c0fb2f7fb8b31d00ccbd
+          old_ai=94bd11a58b9df1194278d07a8808ad24c49d7a83a64e3b9ce42d31dfe6f33eb1
+          cutover_started=false
+          complete=false
+          trap 'status=$?; if [[ "$cutover_started" == true && "$complete" != true ]]; then
+            docker compose --project-directory "$CD_DIRECTORY" --env-file .env stop web
+            docker start "$old_core" "$old_ai" && docker start "$old_web"
+          fi; rm -rf -- "$DOCKER_CONFIG"; exit "$status"' EXIT
+          for container in "$old_web" "$old_core" "$old_ai"; do
+            [[ "$(docker container inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$container")" == storyfork-prod-validation ]] || exit 1
+            [[ "$(docker container inspect --format '{{.State.Running}}' "$container")" == true ]] || exit 1
+          done
           containers=$(docker container ls --all --quiet --filter label=com.docker.compose.project=storyfork-fork-cd-test)
           for container in $containers; do
             [[ "$(docker container inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$container")" == "$CD_DIRECTORY" ]] || exit 1
           done
           printf '%s\n' "$COMPOSE_BASE_YAML" > docker-compose.yaml
           printf '%s\n' "$COMPOSE_PROD_YAML" > docker-compose.prod.yaml
-          printf '%s\n' "$COMPOSE_CI_YAML" > compose.ci.yaml
           cat > compose.fork-test.yaml <<'COMPOSE'
-          # 일회성 CI DB/Mailpit 격리 + 개인 GHCR 이미지 전용, 원본/공유 DB 미접속.
+          # 승인된 새 영속 DB + 내부 Mailpit. 기존/공유 DB와 paid AI는 사용하지 않는다.
           services:
+            postgres:
+              restart: unless-stopped
             mailpit:
               ports: !reset []
+              restart: unless-stopped
             ai-service:
               build: !reset null
               image: ${CD_AI_SERVICE_IMAGE:?Pinned personal image required}
               platform: linux/amd64
+              restart: unless-stopped
+              environment:
+                OPENAI_API_KEY: ""
+                OPENAI_MODEL: ""
             core-api:
               build: !reset null
               image: ${CD_CORE_API_IMAGE:?Pinned personal image required}
               platform: linux/amd64
+              restart: unless-stopped
               environment:
-                APP_CORS_ALLOWED_ORIGIN: http://127.0.0.1:8081
+                CONTENT_ENABLED: "true"
+                CONTENT_DEV_OWNER: ""
+                AUTH_COOKIE_SECURE: "true"
+                APP_CORS_ALLOWED_ORIGIN: ${AUTH_PUBLIC_ORIGIN:?Actual HTTPS origin required}
             web:
               build: !reset null
               image: ${CD_WEB_IMAGE:?Pinned personal image required}
               platform: linux/amd64
-              ports: !override ["127.0.0.1:8081:80"]
+              restart: unless-stopped
+              ports: !override ["127.0.0.1:${CD_WEB_PORT:?Explicit approved port required}:80"]
           COMPOSE
           docker compose --project-directory "$CD_DIRECTORY" --env-file .env config --quiet
           printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
@@ -147,16 +170,28 @@ jobs:
             [[ "$revision" == "$IMAGE_SHA" ]] || exit 1
             printf 'PULLED_REVISION %s %s\n' "$image" "$revision"
           done
-          docker compose --project-directory "$CD_DIRECTORY" --env-file .env up -d --no-build --pull never --wait --wait-timeout 180
+          # 원본8088 앱은 준비 완료 전까지 유지한다. 새 DB는 task-owned named volume이다.
+          CD_WEB_PORT=8081 docker compose --project-directory "$CD_DIRECTORY" --env-file .env up -d --no-build --pull never --wait --wait-timeout 180
           for path in / /api/v1/health /api/v1/health/ai-service; do
             curl --noproxy '*' --retry 60 --retry-delay 2 --retry-all-errors --max-time 10 --fail --silent --show-error --output /dev/null "http://127.0.0.1:8081$path"
+          done
+          count=$(docker compose --project-directory "$CD_DIRECTORY" --env-file .env exec -T postgres sh -c 'psql --no-psqlrc -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM auth_member"')
+          [[ "$count" == 0 ]] || exit 1
+          printf 'CUTOVER_PREFLIGHT_READY fresh durable DB migrated; application HTTP ready; no accounts created\n'
+          cutover_started=true
+          docker stop --time 30 "$old_web" "$old_core" "$old_ai"
+          printf 'OLD_APP_SERVICES_STOPPED preserved original IDs and configuration\n'
+          docker compose --project-directory "$CD_DIRECTORY" --env-file .env up -d --no-build --pull never --wait --wait-timeout 180
+          for path in / /api/v1/health /api/v1/health/ai-service; do
+            curl --noproxy '*' --retry 60 --retry-delay 2 --retry-all-errors --max-time 10 --fail --silent --show-error --output /dev/null "http://127.0.0.1:8088$path"
             printf 'HTTP_READY %s 200\n' "$path"
           done
-          code=$(curl --noproxy '*' --max-time 10 --silent --show-error --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8081/api/v1/me)
+          code=$(curl --noproxy '*' --max-time 10 --silent --show-error --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8088/api/v1/me)
           [[ "$code" == 401 ]] || exit 1
           printf 'HTTP_ANONYMOUS /api/v1/me %s\n' "$code"
           docker compose --project-directory "$CD_DIRECTORY" --env-file .env ps
-          printf 'FORK_SERVER_DEPLOY_COMPLETE\n'
+          complete=true
+          printf 'FORK_SERVER_REPLACEMENT_COMPLETE\n'
           REMOTE
           } | ssh -F /dev/null -T -p 5798 -i "$SSH_DIR/key" \
             -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$SSH_DIR/known_hosts" \
