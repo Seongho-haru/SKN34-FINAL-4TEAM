@@ -1,10 +1,6 @@
 name: CD
 
 on:
-  workflow_run:
-    workflows: [CI]
-    branches: [develop]
-    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -17,7 +13,7 @@ concurrency:
 jobs:
   publish:
     name: Publish develop images
-    if: ${{ (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop') || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'develop' && github.event.workflow_run.head_repository.full_name == github.repository && (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch')) }}
+    if: ${{ false && ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop') || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'develop' && github.event.workflow_run.head_repository.full_name == github.repository && (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch'))) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -59,7 +55,7 @@ jobs:
     needs: publish
     # publish가 같은 저장소 develop의 CI 성공 또는 명시적인 develop 수동 실행만 허용한다.
     # workflow_run의 ref는 기본 브랜치, 수동 실행의 ref는 develop이므로 main-only 검사는 하지 않는다.
-    if: ${{ needs.publish.result == 'success' && vars.DEVELOP_CD_ENABLED == 'true' }}
+    if: ${{ false && (needs.publish.result == 'success' && vars.DEVELOP_CD_ENABLED == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
