@@ -62,7 +62,7 @@ jobs:
       id-token: write
     environment: develop-cd
     env:
-      SSH_DIR: ${{ runner.temp }}/storyfork-ssh
+      SSH_DIR: /tmp/storyfork-ssh-disabled # Hard-disabled job; runner context is invalid at job env scope.
       CD_DEPLOY_DIR: ${{ vars.CD_DEPLOY_DIR }}
       CD_WEB_PORT: ${{ vars.CD_WEB_PORT }}
     steps:
